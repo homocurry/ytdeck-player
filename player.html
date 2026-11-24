@@ -127,12 +127,12 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 5, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
+      deck: deck, v: 6, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
       rate: appliedRate, error: lastError,
-      title: (player.getVideoData && player.getVideoData().title) || ''
+      title: (function () { try { var v = player.getVideoData && player.getVideoData(); return (v && v.title) || ''; } catch (e) { return ''; } })()
     };
     window.synapse.storage.set(STATUS_KEY, st).catch(function () {});
   }
