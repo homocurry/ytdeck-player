@@ -43,7 +43,7 @@
   var msg = document.getElementById('msg');
   var player = null, ready = false, state = null, lastRev = -1;
   var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastCmdAt = 0, lastError = null;
-  var audioBlocked = false, unmuteTriedAt = 0, stuckSince = 0;
+  var audioBlocked = false, unmuteTriedAt = 0, lastPlayingAt = 0, intentAt = Date.now();
 
   function say(t) { msg.textContent = t; }
 
@@ -98,17 +98,15 @@
     if (rate !== appliedRate) { try { player.setPlaybackRate(rate); appliedRate = rate; } catch (e) {} }
 
     var ps = player.getPlayerState();       // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
-    // Autoplay policy: unmuted playback without a user gesture never starts (stays -1/5/2).
-    // If we keep asking to play unmuted and nothing happens for 2s, fall back to muted playback.
-    var wantsPlay = !s.paused && ps !== 1 && ps !== 3 && ps !== 0;
-    if (!wantsPlay) stuckSince = 0;
-    else if (!stuckSince) stuckSince = now;
-    if (wantsPlay && s.muted === false && !audioBlocked && stuckSince && now - stuckSince > 2000) {
+    // Autoplay policy: unmuted playback without a user gesture never starts (it flips between
+    // -1/3/5). If we want to play, unmuted, and nothing has played for 4s, fall back to muted.
+    if (ps === 1) lastPlayingAt = now;
+    if (!s.paused && s.muted === false && !audioBlocked && now - Math.max(lastPlayingAt, intentAt) > 4000) {
       audioBlocked = true;
-      stuckSince = 0;
+      console.warn('[ytdeck player ' + deck + '] unmuted playback refused; continuing muted until the frame is clicked');
       try { player.mute(); } catch (e) {}
       player.loadVideoById({ videoId: loadedVideo, startSeconds: Math.floor(expectedTime(s)) });
-      lastCmdAt = lastSeekAt = now;
+      lastCmdAt = lastSeekAt = intentAt = now;
       return;
     }
     document.body.classList.toggle('covered', !!s.blackOnPause && s.paused);
@@ -132,7 +130,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 7, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
+      deck: deck, v: 8, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
@@ -145,7 +143,7 @@
   function poll() {
     window.synapse.storage.get(STATE_KEY).then(function (r) {
       if (r && r.exists && r.value) {
-        if (r.value.rev !== lastRev) { lastRev = r.value.rev; lastSeekAt = 0; }
+        if (r.value.rev !== lastRev) { lastRev = r.value.rev; lastSeekAt = 0; intentAt = Date.now(); }
         state = r.value;
       }
       apply();
@@ -159,7 +157,7 @@
   }
 
   window.addEventListener('blur', function () {
-    if (audioBlocked) { setTimeout(function () { audioBlocked = false; unmuteTriedAt = Date.now(); try { player.unMute(); player.playVideo(); } catch (e) {} }, 50); }
+    if (audioBlocked) { setTimeout(function () { audioBlocked = false; unmuteTriedAt = intentAt = Date.now(); try { player.unMute(); player.playVideo(); } catch (e) {} }, 50); }
     setTimeout(function () { try { window.focus(); } catch (e) {} }, 100);
   });
 
