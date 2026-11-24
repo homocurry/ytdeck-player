@@ -6,12 +6,19 @@
 <title>YouTube Deck Player</title>
 <style>
   html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
-  #p, #p iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; pointer-events: none; }
+  #p, #p iframe { position: absolute; border: 0; }
+  #p { left: 0; top: 0; width: 100%; height: 100%; }
+  #p iframe { width: 100%; height: 100%; pointer-events: none; }
+  body.crop #p { left: -12%; top: -12%; width: 124%; height: 124%; }
+  body.unlock #p iframe { pointer-events: auto; }
+  #cover { position: absolute; inset: 0; background: #000; display: none; }
+  body.covered #cover { display: block; }
   #msg { position: absolute; left: 8px; bottom: 6px; font: 11px sans-serif; color: #555; }
 </style>
 </head>
 <body>
 <div id="p"></div>
+<div id="cover"></div>
 <div id="msg"></div>
 <script>
 /*
@@ -36,6 +43,7 @@
   var msg = document.getElementById('msg');
   var player = null, ready = false, state = null, lastRev = -1;
   var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastCmdAt = 0, lastError = null;
+  var audioBlocked = false, unmuteTriedAt = 0;
 
   function say(t) { msg.textContent = t; }
 
@@ -78,16 +86,25 @@
     }
     if (!loadedVideo) return;
 
+    document.body.classList.toggle('crop', s.crop !== false);
     try {
       if (typeof s.volume === 'number') player.setVolume(Math.round(s.volume * 100));
-      if (s.muted === false && player.isMuted()) player.unMute();
-      if (s.muted !== false && !player.isMuted()) player.mute();
+      if (s.muted === false && !audioBlocked && player.isMuted()) { player.unMute(); unmuteTriedAt = now; }
+      if ((s.muted !== false || audioBlocked) && !player.isMuted()) player.mute();
     } catch (e) {}
+    document.body.classList.toggle('unlock', s.muted === false && audioBlocked);
 
     var rate = nearestRate(s.playbackRate || 1);
     if (rate !== appliedRate) { try { player.setPlaybackRate(rate); appliedRate = rate; } catch (e) {} }
 
     var ps = player.getPlayerState();       // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+    if (!s.paused && s.muted === false && !audioBlocked && now - unmuteTriedAt < 1500 && (ps === 2 || ps === 5 || ps === -1)) {
+      audioBlocked = true;                   // browser refused unmuted playback: keep the picture going, muted
+      try { player.mute(); } catch (e) {}
+      player.playVideo(); lastCmdAt = now;
+      return;
+    }
+    document.body.classList.toggle('covered', !!s.blackOnPause && s.paused);
     if (ps === 3) return;                    // let YouTube finish buffering; never fight it
 
     var want = expectedTime(s);
@@ -108,7 +125,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 3, t: Date.now(), video: loadedVideo,
+      deck: deck, v: 4, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
@@ -133,6 +150,10 @@
     if (tries > 200) { say('SynapseRack bridge not found (deck ' + deck + ')'); return; }
     setTimeout(function () { waitForBridge(cb, (tries || 0) + 1); }, 50);
   }
+
+  window.addEventListener('blur', function () {
+    if (audioBlocked) { setTimeout(function () { audioBlocked = false; unmuteTriedAt = Date.now(); try { player.unMute(); player.playVideo(); } catch (e) {} }, 50); }
+  });
 
   window.onYouTubeIframeAPIReady = function () {
     player = new YT.Player('p', {
