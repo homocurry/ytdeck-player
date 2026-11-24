@@ -26,15 +26,16 @@
   var deck = (new URLSearchParams(location.search).get('deck') || 'A').replace(/[^A-Za-z0-9_-]/g, '');
   var STATE_KEY = 'ytdeck:' + deck + ':state';
   var STATUS_KEY = 'ytdeck:' + deck + ':status';
-  var POLL_MS = 40, STATUS_MS = 200;
-  var SEEK_THRESHOLD = 0.35;   // seconds off before a hard seek
-  var DEAD_ZONE = 0.04;        // seconds of drift ignored
-  var MAX_NUDGE = 0.1;         // max rate nudge for drift correction
+  var POLL_MS = 60, STATUS_MS = 250;
+  var DRIFT_SEEK = 0.5;        // seconds off (while playing) before a corrective seek
+  var PAUSED_SEEK = 0.15;      // seconds off (while paused) before a seek
+  var SEEK_COOLDOWN = 1200;    // ms between corrective seeks (YouTube buffers after every seek)
+  var CMD_COOLDOWN = 400;      // ms between play/pause commands
   var RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
   var msg = document.getElementById('msg');
   var player = null, ready = false, state = null, lastRev = -1;
-  var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastError = null;
+  var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastCmdAt = 0, lastError = null;
 
   function say(t) { msg.textContent = t; }
 
@@ -54,44 +55,53 @@
     return best;
   }
 
-  function setRate(r) {
-    if (Math.abs(r - appliedRate) < 0.01) return;
-    try { player.setPlaybackRate(r); appliedRate = r; } catch (e) {}
+  function seek(t) {
+    if (!isFinite(t)) return;
+    player.seekTo(Math.max(0, t), true);
+    lastSeekAt = Date.now();
   }
 
   function apply() {
     if (!ready || !state) return;
     var s = state;
+    var now = Date.now();
+
     if (s.videoId && s.videoId !== loadedVideo) {
       loadedVideo = s.videoId;
       lastError = null;
-      var start = expectedTime(s);
-      if (s.paused) player.cueVideoById(s.videoId, start); else player.loadVideoById(s.videoId, start);
-      lastSeekAt = Date.now();
+      var start = Math.floor(expectedTime(s));
+      if (s.paused) player.cueVideoById({ videoId: s.videoId, startSeconds: start });
+      else player.loadVideoById({ videoId: s.videoId, startSeconds: start });
+      lastSeekAt = lastCmdAt = now;
+      appliedRate = 1;
       return;
     }
     if (!loadedVideo) return;
 
-    if (typeof s.volume === 'number') { try { player.setVolume(Math.round(s.volume * 100)); } catch (e) {} }
-    if (s.muted === false && player.isMuted()) player.unMute();
-    if (s.muted !== false && !player.isMuted()) player.mute();
+    try {
+      if (typeof s.volume === 'number') player.setVolume(Math.round(s.volume * 100));
+      if (s.muted === false && player.isMuted()) player.unMute();
+      if (s.muted !== false && !player.isMuted()) player.mute();
+    } catch (e) {}
 
-    var ps = player.getPlayerState();
-    var playing = ps === 1 || ps === 3;
-    if (s.paused && playing) player.pauseVideo();
-    if (!s.paused && !playing && ps !== 3) player.playVideo();
+    var rate = nearestRate(s.playbackRate || 1);
+    if (rate !== appliedRate) { try { player.setPlaybackRate(rate); appliedRate = rate; } catch (e) {} }
+
+    var ps = player.getPlayerState();       // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+    if (ps === 3) return;                    // let YouTube finish buffering; never fight it
 
     var want = expectedTime(s);
     var have = player.getCurrentTime() || 0;
-    var diff = have - want;
-    var base = s.playbackRate || 1;
-    if (Math.abs(diff) > SEEK_THRESHOLD || (s.paused && Math.abs(diff) > 0.05)) {
-      if (Date.now() - lastSeekAt > 150) { player.seekTo(want, true); lastSeekAt = Date.now(); }
-      setRate(nearestRate(base));
-    } else if (!s.paused) {
-      // gentle drift correction (YouTube rounds rates, so this only helps when the player honours it)
-      var nudge = Math.abs(diff) <= DEAD_ZONE ? 0 : Math.max(-MAX_NUDGE, Math.min(MAX_NUDGE, -diff * 0.5));
-      setRate(nudge === 0 ? nearestRate(base) : base + nudge);
+    var diff = Math.abs(have - want);
+    var looping = s.loopStart != null && s.loopEnd != null;
+    var cooldown = looping ? 300 : SEEK_COOLDOWN;
+
+    if (s.paused) {
+      if (ps === 1 && now - lastCmdAt > CMD_COOLDOWN) { player.pauseVideo(); lastCmdAt = now; }
+      if (diff > PAUSED_SEEK && now - lastSeekAt > cooldown) seek(want);
+    } else {
+      if ((ps === 2 || ps === 5 || ps === -1 || ps === 0) && now - lastCmdAt > CMD_COOLDOWN) { player.playVideo(); lastCmdAt = now; }
+      if (diff > DRIFT_SEEK && now - lastSeekAt > cooldown) seek(want);
     }
   }
 
@@ -111,7 +121,7 @@
   function poll() {
     window.synapse.storage.get(STATE_KEY).then(function (r) {
       if (r && r.exists && r.value) {
-        if (r.value.rev !== lastRev) { lastRev = r.value.rev; }
+        if (r.value.rev !== lastRev) { lastRev = r.value.rev; lastSeekAt = 0; }
         state = r.value;
       }
       apply();
@@ -133,7 +143,7 @@
           ready = true; player.mute(); say('');
           waitForBridge(function () { poll(); setInterval(reportStatus, STATUS_MS); });
         },
-        onError: function (e) { lastError = e.data; say('YouTube error ' + e.data); reportStatus(); }
+        onError: function (e) { lastError = e.data; console.warn('[ytdeck player ' + deck + '] YouTube error ' + e.data); reportStatus(); }
       }
     });
   };
