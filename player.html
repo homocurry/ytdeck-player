@@ -46,7 +46,7 @@
   // Chrome refuses unmuted playback until this frame gets a user gesture, and a refused unmute
   // leaves the page unable to play at all. So audio stays locked (muted) until the YouTube frame
   // itself is clicked (the app forwards clicks on the deck preview into this page).
-  var audioBlocked = true, unmuteTriedAt = 0, lastPlayingAt = 0, intentAt = Date.now();
+  var audioBlocked = true, audioRefused = false, unmuteTriedAt = 0, lastPlayingAt = 0, intentAt = Date.now();
 
   function say(t) { msg.textContent = t; }
 
@@ -102,6 +102,15 @@
 
     var ps = player.getPlayerState();       // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
     if (ps === 1) lastPlayingAt = now;
+    // Even after a click, the browser may refuse unmuted playback. Then YouTube parks the player
+    // (paused / thumbnail). Report it so the app can mute this deck and reopen the player.
+    if (!s.paused && s.muted === false && !audioBlocked && !audioRefused && now - Math.max(lastPlayingAt, intentAt) > 2500) {
+      audioRefused = true;
+      console.warn('[ytdeck player ' + deck + '] unmuted playback refused by the browser');
+      try { player.mute(); } catch (e) {}
+      reportStatus();
+      return;
+    }
     document.body.classList.toggle('covered', !!s.blackOnPause && s.paused);
     if (ps === 3) return;                    // let YouTube finish buffering; never fight it
 
@@ -123,7 +132,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 11, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
+      deck: deck, v: 12, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked, audioRefused: audioRefused,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
