@@ -46,6 +46,7 @@
   // Chrome refuses unmuted playback until this frame gets a user gesture, and a refused unmute
   // leaves the page unable to play at all. So audio stays locked (muted) until the YouTube frame
   // itself is clicked (the app forwards clicks on the deck preview into this page).
+  var priming = false;
   var audioBlocked = true, audioRefused = false, unmuteTriedAt = 0, lastPlayingAt = 0, intentAt = Date.now();
 
   function say(t) { msg.textContent = t; }
@@ -81,8 +82,8 @@
       loadedVideo = s.videoId;
       lastError = null;
       var start = Math.floor(expectedTime(s));
-      if (s.paused) player.cueVideoById({ videoId: s.videoId, startSeconds: start });
-      else player.loadVideoById({ videoId: s.videoId, startSeconds: start });
+      try { player.mute(); } catch (e) {}
+      player.loadVideoById({ videoId: s.videoId, startSeconds: start });
       lastSeekAt = lastCmdAt = now;
       appliedRate = 1;
       return;
@@ -121,8 +122,16 @@
     var cooldown = looping ? 300 : SEEK_COOLDOWN;
 
     if (s.paused) {
-      if (ps === 1 && now - lastCmdAt > CMD_COOLDOWN) { player.pauseVideo(); lastCmdAt = now; }
-      if (diff > PAUSED_SEEK && now - lastSeekAt > cooldown) seek(want);
+      // A paused deck must show a real frame, not YouTube's thumbnail: if the player hasn't
+      // rendered anything yet (-1 unstarted / 5 cued), play it muted until the first frame.
+      if ((ps === -1 || ps === 5) && now - lastCmdAt > CMD_COOLDOWN) {
+        try { player.mute(); } catch (e) {}
+        player.playVideo(); lastCmdAt = now; priming = true;
+      }
+      if (ps === 1) {
+        if (priming || now - lastCmdAt > CMD_COOLDOWN) { player.pauseVideo(); lastCmdAt = now; priming = false; seek(want); }
+      }
+      if (ps === 2 && diff > PAUSED_SEEK && now - lastSeekAt > cooldown) seek(want);
     } else {
       if ((ps === 2 || ps === 5 || ps === -1 || ps === 0) && now - lastCmdAt > CMD_COOLDOWN) { player.playVideo(); lastCmdAt = now; }
       if (diff > DRIFT_SEEK && now - lastSeekAt > cooldown) seek(want);
@@ -132,7 +141,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 12, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked, audioRefused: audioRefused,
+      deck: deck, v: 13, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked, audioRefused: audioRefused,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,

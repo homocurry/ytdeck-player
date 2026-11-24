@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>YouTube Deck Player</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #p, #p iframe { position: absolute; border: 0; }
+  #p { left: 0; top: 0; width: 100%; height: 100%; }
+  #p iframe { width: 100%; height: 100%; pointer-events: none; }
+  body.crop #p { left: -12%; top: -12%; width: 124%; height: 124%; }
+  body.unlock #p iframe { pointer-events: auto; }
+  #cover { position: absolute; inset: 0; background: #000; display: none; }
+  body.covered #cover { display: block; }
+  #msg { position: absolute; left: 8px; bottom: 6px; font: 11px sans-serif; color: #555; }
+</style>
+</head>
+<body>
+<div id="p"></div>
+<div id="cover"></div>
+<div id="msg"></div>
+<script>
+/*
+ * YouTube Deck — player page.
+ * Opened by the SynapseRack "YouTube Deck" app as ?deck=A (or B).
+ * Contains no user data: the app writes the deck state into synapse.storage,
+ * this page reads it, drives the YouTube IFrame player and reports status back.
+ * Sync model follows YouTube-VJ (KazuProg): {currentTime, baseTime, playbackRate, paused}.
+ */
+(function () {
+  'use strict';
+  var deck = (new URLSearchParams(location.search).get('deck') || 'A').replace(/[^A-Za-z0-9_-]/g, '');
+  var STATE_KEY = 'ytdeck:' + deck + ':state';
+  var STATUS_KEY = 'ytdeck:' + deck + ':status';
+  var POLL_MS = 60, STATUS_MS = 250;
+  var DRIFT_SEEK = 0.5;        // seconds off (while playing) before a corrective seek
+  var PAUSED_SEEK = 0.15;      // seconds off (while paused) before a seek
+  var SEEK_COOLDOWN = 1200;    // ms between corrective seeks (YouTube buffers after every seek)
+  var CMD_COOLDOWN = 400;      // ms between play/pause commands
+  var RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
+  var msg = document.getElementById('msg');
+  var player = null, ready = false, state = null, lastRev = -1;
+  var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastCmdAt = 0, lastError = null;
+  // Chrome refuses unmuted playback until this frame gets a user gesture, and a refused unmute
+  // leaves the page unable to play at all. So audio stays locked (muted) until the YouTube frame
+  // itself is clicked (the app forwards clicks on the deck preview into this page).
+  var priming = false;
+  var audioBlocked = true, audioRefused = false, unmuteTriedAt = 0, lastPlayingAt = 0, intentAt = Date.now();
+
+  function say(t) { msg.textContent = t; }
+
+  function expectedTime(s) {
+    if (!s) return 0;
+    var t = s.paused ? s.currentTime : s.currentTime + (Date.now() - s.baseTime) / 1000 * (s.playbackRate || 1);
+    if (s.loopStart != null && s.loopEnd != null && s.loopEnd > s.loopStart && t >= s.loopEnd) {
+      var len = s.loopEnd - s.loopStart;
+      t = s.loopStart + ((t - s.loopStart) % len);
+    }
+    return Math.max(0, t);
+  }
+
+  function nearestRate(r) {
+    var best = 1, d = Infinity;
+    for (var i = 0; i < RATES.length; i++) { var x = Math.abs(RATES[i] - r); if (x < d) { d = x; best = RATES[i]; } }
+    return best;
+  }
+
+  function seek(t) {
+    if (!isFinite(t)) return;
+    player.seekTo(Math.max(0, t), true);
+    lastSeekAt = Date.now();
+  }
+
+  function apply() {
+    if (!ready || !state) return;
+    var s = state;
+    var now = Date.now();
+
+    if (s.videoId && s.videoId !== loadedVideo) {
+      loadedVideo = s.videoId;
+      lastError = null;
+      var start = Math.floor(expectedTime(s));
+      try { player.mute(); } catch (e) {}
+      player.loadVideoById({ videoId: s.videoId, startSeconds: start });
+      lastSeekAt = lastCmdAt = now;
+      appliedRate = 1;
+      return;
+    }
+    if (!loadedVideo) return;
+
+    document.body.classList.toggle('crop', s.crop !== false);
+    try {
+      if (typeof s.volume === 'number') player.setVolume(Math.round(s.volume * 100));
+      if (s.muted === false && !audioBlocked && player.isMuted()) { player.unMute(); unmuteTriedAt = now; }
+      if ((s.muted !== false || audioBlocked) && !player.isMuted()) player.mute();
+    } catch (e) {}
+    document.body.classList.toggle('unlock', s.muted === false && audioBlocked);
+
+    var rate = nearestRate(s.playbackRate || 1);
+    if (rate !== appliedRate) { try { player.setPlaybackRate(rate); appliedRate = rate; } catch (e) {} }
+
+    var ps = player.getPlayerState();       // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+    if (ps === 1) lastPlayingAt = now;
+    // Even after a click, the browser may refuse unmuted playback. Then YouTube parks the player
+    // (paused / thumbnail). Report it so the app can mute this deck and reopen the player.
+    if (!s.paused && s.muted === false && !audioBlocked && !audioRefused && now - Math.max(lastPlayingAt, intentAt) > 2500) {
+      audioRefused = true;
+      console.warn('[ytdeck player ' + deck + '] unmuted playback refused by the browser');
+      try { player.mute(); } catch (e) {}
+      reportStatus();
+      return;
+    }
+    document.body.classList.toggle('covered', !!s.blackOnPause && s.paused);
+    if (ps === 3) return;                    // let YouTube finish buffering; never fight it
+
+    var want = expectedTime(s);
+    var have = player.getCurrentTime() || 0;
+    var diff = Math.abs(have - want);
+    var looping = s.loopStart != null && s.loopEnd != null;
+    var cooldown = looping ? 300 : SEEK_COOLDOWN;
+
+    if (s.paused) {
+      // A paused deck must show a real frame, not YouTube's thumbnail: if the player hasn't
+      // rendered anything yet (-1 unstarted / 5 cued), play it muted until the first frame.
+      if ((ps === -1 || ps === 5) && now - lastCmdAt > CMD_COOLDOWN) {
+        try { player.mute(); } catch (e) {}
+        player.playVideo(); lastCmdAt = now; priming = true;
+      }
+      if (ps === 1) {
+        if (priming || now - lastCmdAt > CMD_COOLDOWN) { player.pauseVideo(); lastCmdAt = now; priming = false; seek(want); }
+      }
+      if (ps === 2 && diff > PAUSED_SEEK && now - lastSeekAt > cooldown) seek(want);
+    } else {
+      if ((ps === 2 || ps === 5 || ps === -1 || ps === 0) && now - lastCmdAt > CMD_COOLDOWN) { player.playVideo(); lastCmdAt = now; }
+      if (diff > DRIFT_SEEK && now - lastSeekAt > cooldown) seek(want);
+    }
+  }
+
+  function reportStatus() {
+    if (!window.synapse || !ready) return;
+    var st = {
+      deck: deck, v: 13, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked, audioRefused: audioRefused,
+      time: player.getCurrentTime ? player.getCurrentTime() : 0,
+      duration: player.getDuration ? player.getDuration() : 0,
+      state: player.getPlayerState ? player.getPlayerState() : -1,
+      rate: appliedRate, error: lastError,
+      title: (function () { try { var v = player.getVideoData && player.getVideoData(); return (v && v.title) || ''; } catch (e) { return ''; } })()
+    };
+    window.synapse.storage.set(STATUS_KEY, st).catch(function () {});
+  }
+
+  function poll() {
+    window.synapse.storage.get(STATE_KEY).then(function (r) {
+      if (r && r.exists && r.value) {
+        if (r.value.rev !== lastRev) { lastRev = r.value.rev; lastSeekAt = 0; intentAt = Date.now(); }
+        state = r.value;
+      }
+      apply();
+    }).catch(function () {}).then(function () { setTimeout(poll, POLL_MS); });
+  }
+
+  function waitForBridge(cb, tries) {
+    if (window.synapse && window.synapse.storage) return cb();
+    if (tries > 200) { say('SynapseRack bridge not found (deck ' + deck + ')'); return; }
+    setTimeout(function () { waitForBridge(cb, (tries || 0) + 1); }, 50);
+  }
+
+  window.addEventListener('blur', function () {
+    if (audioBlocked) { setTimeout(function () { audioBlocked = false; unmuteTriedAt = intentAt = Date.now(); try { if (state && state.muted === false) player.unMute(); player.playVideo(); } catch (e) {} }, 50); }
+    setTimeout(function () { try { window.focus(); } catch (e) {} }, 100);
+  });
+
+  var started = false;
+  function createPlayer() {
+    var host = document.getElementById('p');
+    if (!host) { host = document.createElement('div'); host.id = 'p'; document.body.insertBefore(host, document.getElementById('cover')); }
+    player = new YT.Player('p', {
+      width: '100%', height: '100%',
+      playerVars: { controls: 0, disablekb: 1, playsinline: 1, rel: 0, iv_load_policy: 3, fs: 0, mute: 1, origin: location.origin },
+      events: {
+        onReady: function () {
+          ready = true; player.mute(); say('');
+          if (!started) { started = true; waitForBridge(function () { poll(); setInterval(reportStatus, STATUS_MS); }); }
+        },
+        onError: function (e) { lastError = e.data; console.warn('[ytdeck player ' + deck + '] YouTube error ' + e.data); reportStatus(); }
+      }
+    });
+  }
+  // After a refused unmuted start, YouTube keeps the player stuck (thumbnail). A fresh, muted
+  // player instance is the only reliable way back.
+  function recreatePlayer() {
+    ready = false; loadedVideo = null; appliedRate = 1;
+    try { player.destroy(); } catch (e) {}
+    var old = document.getElementById('p'); if (old) old.remove();
+    createPlayer();
+  }
+  window.onYouTubeIframeAPIReady = createPlayer;
+
+  var s = document.createElement('script');
+  s.src = 'https://www.youtube.com/iframe_api';
+  s.onerror = function () { say('Could not load YouTube IFrame API'); };
+  document.head.appendChild(s);
+  say('deck ' + deck + ' loading…');
+})();
+</script>
+</body>
+</html>
