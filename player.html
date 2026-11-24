@@ -108,7 +108,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, t: Date.now(), video: loadedVideo,
+      deck: deck, v: 3, t: Date.now(), video: loadedVideo,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
