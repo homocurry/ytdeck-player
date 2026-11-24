@@ -43,7 +43,7 @@
   var msg = document.getElementById('msg');
   var player = null, ready = false, state = null, lastRev = -1;
   var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastCmdAt = 0, lastError = null;
-  var audioBlocked = false, unmuteTriedAt = 0;
+  var audioBlocked = false, unmuteTriedAt = 0, stuckSince = 0;
 
   function say(t) { msg.textContent = t; }
 
@@ -98,10 +98,15 @@
     if (rate !== appliedRate) { try { player.setPlaybackRate(rate); appliedRate = rate; } catch (e) {} }
 
     var ps = player.getPlayerState();       // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
-    if (!s.paused && s.muted === false && !audioBlocked && now - unmuteTriedAt < 1500 && (ps === 2 || ps === 5 || ps === -1)) {
-      audioBlocked = true;                   // browser refused unmuted playback: keep the picture going, muted
+    // Autoplay policy: unmuted playback without a user gesture never starts (stays -1/5/2).
+    // If we keep asking to play unmuted and nothing happens for 2s, fall back to muted playback.
+    var wantsPlay = !s.paused && ps !== 1 && ps !== 3 && ps !== 0;
+    if (!wantsPlay) stuckSince = 0;
+    else if (!stuckSince) stuckSince = now;
+    if (wantsPlay && s.muted === false && !audioBlocked && stuckSince && now - stuckSince > 2000) {
+      audioBlocked = true;
+      stuckSince = 0;
       try { player.mute(); } catch (e) {}
-      // YouTube stays "unstarted" after a refused unmute, so reload the video muted at the right spot
       player.loadVideoById({ videoId: loadedVideo, startSeconds: Math.floor(expectedTime(s)) });
       lastCmdAt = lastSeekAt = now;
       return;
@@ -127,7 +132,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 6, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
+      deck: deck, v: 7, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
