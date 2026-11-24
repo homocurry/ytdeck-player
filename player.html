@@ -43,7 +43,9 @@
   var msg = document.getElementById('msg');
   var player = null, ready = false, state = null, lastRev = -1;
   var loadedVideo = null, appliedRate = 1, lastSeekAt = 0, lastCmdAt = 0, lastError = null;
+  var BLOCK_KEY = 'ytdeck-audio-blocked-' + deck;
   var audioBlocked = false, unmuteTriedAt = 0, lastPlayingAt = 0, intentAt = Date.now();
+  try { audioBlocked = sessionStorage.getItem(BLOCK_KEY) === '1'; } catch (e) {}
 
   function say(t) { msg.textContent = t; }
 
@@ -104,8 +106,10 @@
     if (!s.paused && s.muted === false && !audioBlocked && now - Math.max(lastPlayingAt, intentAt) > 4000) {
       audioBlocked = true;
       console.warn('[ytdeck player ' + deck + '] unmuted playback refused; continuing muted until the frame is clicked');
-      lastCmdAt = lastSeekAt = intentAt = now;
-      recreatePlayer();
+      // Once Chrome refuses an unmuted start, this document won't autoplay at all any more (even
+      // muted, even with a new player). Reload the page and stay muted until the frame is clicked.
+      try { sessionStorage.setItem(BLOCK_KEY, '1'); } catch (e) {}
+      location.reload();
       return;
     }
     document.body.classList.toggle('covered', !!s.blackOnPause && s.paused);
@@ -129,7 +133,7 @@
   function reportStatus() {
     if (!window.synapse || !ready) return;
     var st = {
-      deck: deck, v: 9, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
+      deck: deck, v: 10, t: Date.now(), video: loadedVideo, audioBlocked: audioBlocked,
       time: player.getCurrentTime ? player.getCurrentTime() : 0,
       duration: player.getDuration ? player.getDuration() : 0,
       state: player.getPlayerState ? player.getPlayerState() : -1,
@@ -156,7 +160,7 @@
   }
 
   window.addEventListener('blur', function () {
-    if (audioBlocked) { setTimeout(function () { audioBlocked = false; unmuteTriedAt = intentAt = Date.now(); try { player.unMute(); player.playVideo(); } catch (e) {} }, 50); }
+    if (audioBlocked) { setTimeout(function () { audioBlocked = false; try { sessionStorage.removeItem(BLOCK_KEY); } catch (e) {} unmuteTriedAt = intentAt = Date.now(); try { player.unMute(); player.playVideo(); } catch (e) {} }, 50); }
     setTimeout(function () { try { window.focus(); } catch (e) {} }, 100);
   });
 
